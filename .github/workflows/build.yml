@@ -27,10 +27,12 @@ jobs:
 
     - name: Download and Setup VST3 SDK
       run: |
+        set -euo pipefail # Exit immediately if a command exits with a non-zero status.
+
         # Define the VST3 SDK version or commit hash you want to use
         # This is an example, check Steinberg's GitHub for the latest stable release
-        VST3_SDK_VERSION="3.7.11" # Or a specific commit hash
-        SDK_ARCHIVE="vstsdk${VST3_SDK_VERSION}_24_08_2023_build_203.zip" # Updated archive name for 3.7.11
+        VST3_SDK_VERSION="3.7.11"
+        SDK_ARCHIVE="vstsdk${VST3_SDK_VERSION}_24_08_2023_build_203.zip"
         SDK_URL="https://github.com/steinbergmedia/vst3sdk/releases/download/${VST3_SDK_VERSION}/${SDK_ARCHIVE}"
 
         # Create a directory for the SDK
@@ -39,7 +41,27 @@ jobs:
 
         # Download the SDK
         echo "Downloading VST3 SDK from: ${SDK_URL}"
-        curl -L "${SDK_URL}" -o "${SDK_ARCHIVE}"
+        # Use -f to fail silently on server errors (400 or greater), -L to follow redirects
+        # -sS for silent but show errors (no progress bar)
+        curl -fL -sS "${SDK_URL}" -o "${SDK_ARCHIVE}"
+
+        # Verify the downloaded file
+        if [ ! -f "${SDK_ARCHIVE}" ]; then
+          echo "Error: VST3 SDK archive '${SDK_ARCHIVE}' was not downloaded."
+          exit 1
+        fi
+        
+        # Check file size (SDK is typically > 10MB)
+        # Use 'stat' command compatible with both Linux and macOS
+        FILE_SIZE=$(stat -c %s "${SDK_ARCHIVE}" 2>/dev/null || stat -f %z "${SDK_ARCHIVE}")
+        if [ "${FILE_SIZE}" -lt 10000000 ]; then # Check if file is smaller than 10MB
+          echo "Error: Downloaded VST3 SDK archive '${SDK_ARCHIVE}' is too small (${FILE_SIZE} bytes)."
+          echo "This might indicate an incomplete download or an error page was downloaded instead of the zip."
+          echo "First 20 lines of the downloaded file:"
+          head -n 20 "${SDK_ARCHIVE}" || true # Print content, ignore errors if file is too small
+          exit 1
+        fi
+        echo "Downloaded VST3 SDK archive size: ${FILE_SIZE} bytes"
 
         # Unzip the SDK
         if [[ "${{ runner.os }}" == "Windows" ]]; then
@@ -51,6 +73,13 @@ jobs:
         # Determine the actual SDK root directory after extraction
         # It's usually named 'VST3 SDK' or similar
         SDK_ROOT_DIR=$(find . -maxdepth 2 -type d -name "*VST3 SDK*" -print -quit || find . -maxdepth 2 -type d -name "*vst3sdk*" -print -quit || echo ".")
+        if [ "${SDK_ROOT_DIR}" = "." ]; then
+          echo "Error: Could not find VST3 SDK root directory after extraction."
+          # List contents to help debug
+          ls -F
+          ls -F *VST3* || true
+          exit 1
+        fi
         echo "Detected VST3 SDK root: ${SDK_ROOT_DIR}"
 
         # Set the VST3_SDK_PATH environment variable for subsequent steps
