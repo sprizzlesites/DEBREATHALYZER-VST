@@ -30,7 +30,7 @@ jobs:
         # Define the VST3 SDK version or commit hash you want to use
         # This is an example, check Steinberg's GitHub for the latest stable release
         VST3_SDK_VERSION="3.7.11" # Or a specific commit hash
-                SDK_ARCHIVE="VST_SDK_${VST3_SDK_VERSION}_build_11_11_2023.zip" # Correct name for 3.7.11, adjust for other versions
+        SDK_ARCHIVE="vstsdk${VST3_SDK_VERSION}_24_08_2023_build_203.zip" # Updated archive name for 3.7.11
         SDK_URL="https://github.com/steinbergmedia/vst3sdk/releases/download/${VST3_SDK_VERSION}/${SDK_ARCHIVE}"
 
         # Create a directory for the SDK
