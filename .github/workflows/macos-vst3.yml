@@ -1,0 +1,65 @@
+name: macOS VST3
+
+# Focused, minute-frugal build: only the macOS VST3 (universal arm64+x86_64).
+# Use this when you just need a Mac-compatible VST3 without running a full
+# multi-OS matrix. Runs on manual dispatch, and on a push that TOUCHES THIS
+# FILE — so it can be kicked from a feature branch (where workflow_dispatch is
+# unavailable, since that only works from the default branch) without firing on
+# ordinary code pushes.
+#
+# Builds the DeBreathalyzer JUCE target; the artefact directory is
+# "DeBreathalyzer_artefacts".
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/macos-vst3.yml'
+
+jobs:
+  build:
+    name: macOS VST3 (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache JUCE
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: juce-macos-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure (universal binary)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+      - name: Build VST3
+        run: cmake --build build --config Release --target DeBreathalyzer_VST3 --parallel 4
+
+      # Ad-hoc signing is required for the bundle to load at all on Apple
+      # Silicon. The user still clears Gatekeeper quarantine once on first use:
+      #   xattr -dr com.apple.quarantine DeBreathalyzer.vst3
+      - name: Ad-hoc sign
+        run: codesign --force --deep --sign - "build/DeBreathalyzer_artefacts/Release/VST3/DeBreathalyzer.vst3"
+
+      - name: Validate VST3 loads (pluginval)
+        run: |
+          curl -sSLO https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_macOS.zip
+          unzip -q pluginval_macOS.zip -d pluginval
+          ./pluginval/pluginval.app/Contents/MacOS/pluginval \
+            --strictness-level 5 --skip-gui-tests --verbose \
+            --validate "build/DeBreathalyzer_artefacts/Release/VST3/DeBreathalyzer.vst3"
+
+      # ditto preserves the bundle's symlinks/permissions through the zip
+      # (plain upload-artifact would strip them and break the bundle).
+      - name: Stage artifact
+        run: |
+          mkdir -p staging
+          ditto -c -k --keepParent \
+            "build/DeBreathalyzer_artefacts/Release/VST3/DeBreathalyzer.vst3" \
+            "staging/DeBreathalyzer-VST3-macOS.zip"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeBreathalyzer-VST3-macOS
+          path: staging/
+          if-no-files-found: error
