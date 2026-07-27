@@ -1,10 +1,60 @@
 #include "BreathDetector.h"
 
+namespace
+{
+    // ---- Feature thresholds -------------------------------------------------
+    // These describe the acoustics of breath vs. sibilance and are deliberately
+    // NOT user-tunable: they're physics, not taste. Sensitivity moves the
+    // decision threshold and the level gate, not these.
+
+    // Every spectral measure below is taken over a FIXED analysis band rather
+    // than out to Nyquist. Taking them to Nyquist would make them sample-rate
+    // dependent: at 96 kHz the extra (near-empty) top octaves drag a
+    // linear-bin centroid upward and dilute the energy ratios, so thresholds
+    // calibrated at 44.1 kHz would quietly stop working. Nothing above 12 kHz
+    // helps separate breath from sibilance anyway.
+    constexpr double analysisCeilingHz = 12000.0;
+
+    // Spectral centroid, measured over the analysis band. Note these are much
+    // higher than the "breath is 1-2.5 kHz" figures quoted in the literature:
+    // those describe where the energy peaks, whereas a linear-bin centroid is
+    // pulled upward by the sheer number of high bins. Calibrated against
+    // measured frames (see Test/BreathDetectorTest.cpp).
+    constexpr float centroidFullCreditHz = 4200.0f;
+    constexpr float centroidZeroHz       = 7000.0f;
+
+    // Fraction of in-band energy above 5 kHz. This is the single strongest
+    // discriminator: breath sits around 0.05, /s/ near 0.99, /esh/ near 0.8.
+    constexpr float hfRatioFullCredit = 0.16f;
+    constexpr float hfRatioZero       = 0.42f;
+    // Above this the frame is sibilance, full stop - no score can rescue it.
+    constexpr float hfRatioVeto       = 0.50f;
+
+    // Zero-crossing rate: cheap and correlated with centroid, kept as a
+    // low-weight corroborating vote. Breath sits well below fricatives.
+    constexpr float zcrFullCredit = 0.20f;
+    constexpr float zcrZero       = 0.42f;
+
+    // Band edges used for the energy split (Hz).
+    constexpr double bandLowHz     = 300.0;    // below this: rumble/fundamental
+    constexpr double bandBreathHi  = 3500.0;   // breath band upper edge
+    constexpr double bandHfLo      = 5000.0;   // sibilance band lower edge
+    constexpr double flatnessLoHz  = 300.0;    // flatness measured over this
+    constexpr double flatnessHiHz  = 10000.0;  // range only
+
+    // Maps x to 1.0 at or below `full`, 0.0 at or above `zero`, linear between.
+    inline float rampDown (float x, float full, float zero) noexcept
+    {
+        return juce::jlimit (0.0f, 1.0f, (zero - x) / (zero - full));
+    }
+}
+
 BreathDetector::BreathDetector()
 {
     history.resize ((size_t) fftSize, 0.0f);
     windowedTime.resize ((size_t) fftSize, 0.0f);
     fftScratch.resize ((size_t) fftSize * 2, 0.0f);
+    decimated.resize ((size_t) (fftSize / 2), 0.0f);
 }
 
 void BreathDetector::prepare (double newSampleRate, int /*maxBlockSize*/)
@@ -20,7 +70,6 @@ void BreathDetector::reset()
     historyWrite = 0;
     samplesSinceHop = 0;
     loudPassageEnvelope = 0.063f;
-    candidateActive = false;
     candidateHopSamples = 0;
     targetGain = 1.0f;
     currentGain = 1.0f;
@@ -103,88 +152,147 @@ void BreathDetector::analyseFrame()
     else
         loudPassageEnvelope = shortTermRms + fallCoeff * (loudPassageEnvelope - shortTermRms);
 
-    // --- spectral flatness & (unused) centroid via FFT magnitude spectrum -
+    // --- spectrum: centroid, band energies, flatness -----------------------
     std::fill (fftScratch.begin(), fftScratch.end(), 0.0f);
     std::copy (windowedTime.begin(), windowedTime.end(), fftScratch.begin());
     window.multiplyWithWindowingTable (fftScratch.data(), (size_t) fftSize);
     fft.performFrequencyOnlyForwardTransform (fftScratch.data());
 
     const int numBins = fftSize / 2;
-    double sumMag = 0.0, sumLogMag = 0.0;
-    int usedBins = 0;
-    for (int k = 1; k < numBins; ++k) // skip DC
+    const double binHz = sampleRate / (double) fftSize;
+
+    double sumMag = 0.0, weightedFreqSum = 0.0;
+    double energyTotal = 0.0, energyHigh = 0.0, energyBreathBand = 0.0;
+    double flatSumLog = 0.0, flatSumMag = 0.0;
+    int flatBins = 0;
+
+    // Stop at the fixed analysis ceiling (or Nyquist, whichever is lower) so
+    // every ratio below means the same thing at 44.1 kHz and at 96 kHz.
+    const int ceilingBin = juce::jlimit (2, numBins,
+                                          (int) std::ceil (analysisCeilingHz / binHz));
+
+    for (int k = 1; k < ceilingBin; ++k) // skip DC
     {
-        const double mag = (double) fftScratch[(size_t) k];
+        const double mag  = (double) fftScratch[(size_t) k];
+        const double freq = (double) k * binHz;
+        const double e    = mag * mag;
+
         sumMag += mag;
-        sumLogMag += std::log (mag + 1.0e-9);
-        ++usedBins;
+        weightedFreqSum += freq * mag;
+        energyTotal += e;
+
+        if (freq >= bandLowHz && freq < bandBreathHi)
+            energyBreathBand += e;
+        if (freq >= bandHfLo)
+            energyHigh += e;
+
+        // Flatness over a speech-relevant band only: DC/rumble and the very
+        // top octave otherwise skew the geometric mean and blunt the
+        // voiced/unvoiced separation.
+        if (freq >= flatnessLoHz && freq <= flatnessHiHz)
+        {
+            flatSumMag += mag;
+            flatSumLog += std::log (mag + 1.0e-9);
+            ++flatBins;
+        }
     }
-    const double arithMean = sumMag / juce::jmax (1, usedBins);
-    const double geoMean = std::exp (sumLogMag / juce::jmax (1, usedBins));
-    const float spectralFlatness = (float) juce::jlimit (0.0, 1.0, geoMean / (arithMean + 1.0e-9));
+
+    const float centroidHz = (float) (weightedFreqSum / (sumMag + 1.0e-12));
+    const float hfRatio    = (float) (energyHigh / (energyTotal + 1.0e-12));
+    const float breathBandRatio = (float) (energyBreathBand / (energyTotal + 1.0e-12));
+
+    const double flatArith = flatSumMag / juce::jmax (1, flatBins);
+    const double flatGeo   = std::exp (flatSumLog / juce::jmax (1, flatBins));
+    const float spectralFlatness = (float) juce::jlimit (0.0, 1.0, flatGeo / (flatArith + 1.0e-12));
 
     // --- harmonicity: peak normalised autocorrelation in the vocal pitch
-    //     range (70-500 Hz). High peak = periodic/voiced, low peak = noisy.
-    const int minLag = juce::jmax (1, (int) std::round (sampleRate / 500.0));
-    const int maxLag = juce::jmin (fftSize - 1, (int) std::round (sampleRate / 70.0));
+    //     range (70-500 Hz). High peak = periodic/voiced, low = noisy.
+    //     Computed on a 2x-decimated copy: this is a coarse voicing measure,
+    //     not a pitch tracker, and decimating cuts the cost ~4x (which matters
+    //     at 96 kHz, where the lag search would otherwise dominate the block).
+    const int decCount = fftSize / 2;
+    for (int i = 0; i < decCount; ++i)
+        decimated[(size_t) i] = 0.5f * (windowedTime[(size_t) (i * 2)]
+                                        + windowedTime[(size_t) (i * 2 + 1)]);
+
+    const double decRate = sampleRate * 0.5;
+    const int minLag = juce::jmax (1, (int) std::round (decRate / 500.0));
+    const int maxLag = juce::jmin (decCount - 1, (int) std::round (decRate / 70.0));
 
     double acf0 = 0.0;
-    for (int i = 0; i < fftSize; ++i)
-        acf0 += (double) windowedTime[(size_t) i] * windowedTime[(size_t) i];
+    for (int i = 0; i < decCount; ++i)
+        acf0 += (double) decimated[(size_t) i] * decimated[(size_t) i];
 
     double peakAcf = 0.0;
     for (int lag = minLag; lag <= maxLag; ++lag)
     {
         double sum = 0.0;
-        const int count = fftSize - lag;
+        const int count = decCount - lag;
         for (int i = 0; i < count; ++i)
-            sum += (double) windowedTime[(size_t) i] * windowedTime[(size_t) (i + lag)];
+            sum += (double) decimated[(size_t) i] * decimated[(size_t) (i + lag)];
 
-        const double normalised = sum / (acf0 + 1.0e-9);
-        peakAcf = juce::jmax (peakAcf, normalised);
+        peakAcf = juce::jmax (peakAcf, sum / (acf0 + 1.0e-12));
     }
     const float harmonicity = (float) juce::jlimit (0.0, 1.0, peakAcf);
 
-    // --- combine into a 0..1 breathiness score -----------------------------
-    const float flatnessScore    = spectralFlatness;
-    const float harmonicityScore = 1.0f - harmonicity;
+    // --- score -------------------------------------------------------------
+    // Two independent questions, multiplied - a frame must pass BOTH:
+    //
+    //   1. noisiness   - is this unvoiced noise rather than a sung/spoken tone?
+    //                    (flatness + inharmonicity)
+    //   2. breathShape - is that noise LOW-FREQUENCY weighted, i.e. breath
+    //                    rather than sibilance? (centroid + HF ratio + ZCR)
+    //
+    // Adding these instead of multiplying was the original mistake: sibilance
+    // scores just as high as breath on noisiness, so an additive score let
+    // /s/ and /esh/ clear the threshold on the noise terms alone.
+    const float noisiness = juce::jlimit (0.0f, 1.0f,
+        0.5f * spectralFlatness + 0.5f * (1.0f - harmonicity));
 
-    // ZCR membership: breath sits between voiced vowels (low ZCR) and strong
-    // fricatives/sibilance (very high ZCR) - a triangular band gives partial
-    // credit near the centre and excludes both extremes.
-    constexpr float zcrLo = 0.02f, zcrCentre = 0.15f, zcrHi = 0.42f;
-    float zcrScore = 0.0f;
-    if (zcr > zcrLo && zcr < zcrHi)
-        zcrScore = (zcr <= zcrCentre) ? (zcr - zcrLo) / (zcrCentre - zcrLo)
-                                       : (zcrHi - zcr) / (zcrHi - zcrCentre);
+    const float centroidScore = rampDown (centroidHz, centroidFullCreditHz, centroidZeroHz);
+    const float hfScore       = rampDown (hfRatio, hfRatioFullCredit, hfRatioZero);
+    const float zcrScore      = rampDown (zcr, zcrFullCredit, zcrZero);
 
-    const float compositeScore = juce::jlimit (0.0f, 1.0f,
-        0.40f * flatnessScore + 0.35f * harmonicityScore + 0.25f * zcrScore);
+    const float breathShape = juce::jlimit (0.0f, 1.0f,
+        0.45f * centroidScore + 0.35f * hfScore + 0.20f * zcrScore);
 
-    // Energy gate: only passages clearly quieter than the recent loud
-    // singing (but still above the noise floor) are plausible breaths. The
-    // margin/taper are wide because real breaths range from almost as loud
-    // as the singing to barely audible.
+    // A breath also has to actually have energy in the breath band; a frame
+    // that is all rumble (or all hiss) is not one.
+    const float bandScore = juce::jlimit (0.0f, 1.0f, breathBandRatio / 0.35f);
+
+    // --- level gate --------------------------------------------------------
+    // Only passages quieter than the recent singing are plausible breaths, but
+    // the upper edge is SOFT: a close-mic'd breath can sit only a few dB below
+    // the vocal, and a hard gate there silently discarded exactly those (the
+    // main source of missed breaths). Voiced material is already excluded by
+    // `noisiness`, so a permissive level gate costs little.
     const float shortTermDb = juce::Decibels::gainToDecibels (shortTermRms, -100.0f);
     const float loudDb = juce::Decibels::gainToDecibels (loudPassageEnvelope, -100.0f);
-    const float ceilingDb = loudDb - juce::jmap (params.sensitivity, 0.0f, 1.0f, 12.0f, 2.0f);
-    constexpr float floorDb = -65.0f;
-    constexpr float edgeDb  = 6.0f;
-    const float riseGate = juce::jlimit (0.0f, 1.0f, (shortTermDb - floorDb) / edgeDb);
-    const float fallGate = juce::jlimit (0.0f, 1.0f, (ceilingDb - shortTermDb) / edgeDb);
-    const float energyGate = riseGate * fallGate;
+    const float ceilingDb = loudDb - juce::jmap (params.sensitivity, 0.0f, 1.0f, 14.0f, 2.0f);
+    constexpr float floorDb = -68.0f;
+    const float riseGate = juce::jlimit (0.0f, 1.0f, (shortTermDb - floorDb) / 6.0f);
+    const float fallGate = juce::jlimit (0.0f, 1.0f, (ceilingDb - shortTermDb) / 10.0f);
+    const float energyGate = riseGate * (0.5f + 0.5f * fallGate);
 
-    const float finalScore = compositeScore * energyGate;
+    float finalScore = noisiness * breathShape * bandScore * energyGate;
+
+    // Hard sibilance veto: nothing with this much high-frequency energy is a
+    // breath, whatever the other features say.
+    if (hfRatio >= hfRatioVeto)
+        finalScore = 0.0f;
+
     lastScore = finalScore;
 
-    const float threshold = juce::jmap (params.sensitivity, 0.0f, 1.0f, 0.70f, 0.30f);
+    const float threshold = juce::jmap (params.sensitivity, 0.0f, 1.0f, 0.50f, 0.16f);
     const bool detectedThisHop = finalScore >= threshold;
 
-    // Minimum-duration debounce on the way IN only; the release ramp (above,
-    // per-sample) already handles smoothing on the way out. A leaky integrator
-    // rather than a hard reset: breath frames are noisy and the score jitters
-    // hop to hop, so one stray miss inside an otherwise-continuous breath
-    // shouldn't throw away all accumulated progress toward the minimum length.
+    // Minimum-duration debounce on the way IN only; the release ramp (in
+    // process(), per-sample) handles smoothing on the way out. A leaky
+    // integrator rather than a hard reset: breath frames are noisy and the
+    // score jitters hop to hop, so one stray miss inside an otherwise
+    // continuous breath shouldn't discard all progress toward the minimum
+    // length. The leak is faster than the fill, so a sibilant that only
+    // flickers into detection never accumulates enough to engage.
     if (detectedThisHop)
         candidateHopSamples += hopSize;
     else

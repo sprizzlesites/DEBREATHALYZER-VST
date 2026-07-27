@@ -18,26 +18,44 @@ level, then suppressing until sung/spoken content returns).
 
 ## Detection
 
-Every ~5.8 ms hop, a 1024-sample analysis window is scored on:
+Every ~5.8 ms hop, a 1024-sample analysis window is scored on two independent
+questions, and a frame has to pass **both**:
 
-- **Short-time energy**, gated against a slow "how loud is this performance"
-  envelope — only passages clearly quieter than the recent singing (but still
-  above the noise floor) are plausible breath candidates.
-- **Zero-crossing rate**, using a triangular membership band: breath sits
-  above voiced vowels and below strong fricatives/sibilance, so both extremes
-  score low.
-- **Spectral flatness**, from an FFT magnitude spectrum — breath/noise is
-  close to flat (geometric mean ≈ arithmetic mean); voiced content is peaky.
+**1. Is this unvoiced noise at all** (rather than a sung or spoken tone)?
+
+- **Spectral flatness** — noise is flat (geometric mean ≈ arithmetic mean);
+  voiced content is peaky and harmonic.
 - **Harmonicity**, the peak of the normalised autocorrelation in the vocal
-  pitch range (70–500 Hz) — high peak means periodic/voiced, low peak means
-  inharmonic/noisy.
+  pitch range (70–500 Hz) — high peak means periodic/voiced, low means noisy.
 
-The four combine into a 0–1 breathiness score compared against a threshold set
-by **Sensitivity**. A **Min Length** debounce (default 50 ms) has to elapse
-before the reduction engages, so short consonants don't false-trigger; once
-engaged, gain moves smoothly (**Attack**/**Release**) toward an adjustable
-**Reduction** depth in dB — never a full mute, so a de-breathed take still
-sounds like a breath happened, just quieter.
+**2. Is that noise low-frequency weighted** — a breath rather than sibilance?
+
+This is the group that actually separates a breath from `/s/` and `/sh/`,
+which are every bit as noisy and inharmonic as a breath is:
+
+- **High-frequency energy ratio** (above 5 kHz) — the strongest single
+  discriminator: breath measures ≈0.05, `/s/` ≈0.99, `/sh/` ≈0.8. Above 0.5
+  the frame is vetoed outright as sibilance.
+- **Spectral centroid**, and the fraction of energy landing in the 300 Hz –
+  3.5 kHz breath band.
+- **Zero-crossing rate**, as a cheap corroborating vote.
+
+The two groups are **multiplied, not added**. Adding them lets sibilance clear
+the threshold on the noise features alone — which is audible as consonants
+getting chewed up. All the spectral measures are taken over a fixed analysis
+band rather than out to Nyquist, so the thresholds mean the same thing at
+44.1 kHz and 96 kHz; the test suite runs the whole battery at 44.1/48/96 kHz
+to keep that honest.
+
+A level gate additionally prefers frames quieter than the recent singing, but
+its upper edge is deliberately **soft** — a close-mic'd breath can sit only a
+few dB below the vocal, and a hard gate there discards exactly those.
+
+A **Min Length** debounce (default 100 ms) then has to elapse before reduction
+engages, so short consonants don't false-trigger; once engaged, gain moves
+smoothly (**Attack**/**Release**) toward an adjustable **Reduction** depth in
+dB — never a full mute, so a de-breathed take still sounds like a breath
+happened, just quieter.
 
 An optional **Lookahead** (0–20 ms) delays the audio path relative to
 detection so the duck can start smoothing in slightly ahead of a breath's
@@ -68,9 +86,12 @@ cmake --build build-test --target DeBreathalyzerTest -j
 ./build-test/DeBreathalyzerTest_artefacts/Release/DeBreathalyzerTest
 ```
 
-Feeds synthetic voiced (harmonic) audio with a synthetic breath (filtered
-noise) spliced in, and asserts the voiced sections stay untouched while the
-breath is ducked.
+Splices synthetic voiced (harmonic) audio, breaths (low-mid filtered noise)
+and sibilants (`/s/` and `/sh/`, HF-weighted noise) together and asserts that
+breaths get ducked while voiced material *and sibilants* are left alone — at
+44.1, 48 and 96 kHz. The sibilant cases are the important ones: a test with
+only "voiced + breath" will happily pass a detector that destroys every
+consonant.
 
 ### Windows VST3, cross-compiled locally (no CI minutes)
 

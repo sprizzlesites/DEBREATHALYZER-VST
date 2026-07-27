@@ -25,23 +25,35 @@
     This class follows the same shape, adapted to be causal/streamable for a
     real-time plugin instead of an offline whole-file analysis:
 
-      - short-time energy (RMS, relative to a slow-moving "loud passage"
-        envelope so only passages quieter than the singing are candidates)
-      - zero-crossing rate (breath sits in a mid ZCR band: above voiced
-        vowels, below strong fricative/sibilance ZCR)
-      - spectral flatness (breath/noise is close to white/flat; voiced
-        content is peaky/harmonic, i.e. NOT flat)
-      - harmonicity, via the peak of the normalised autocorrelation in the
-        vocal pitch range (low peak = inharmonic = breath-like)
+    The features fall into two groups, and a frame must satisfy BOTH:
 
-    The four are combined into a 0..1 "breathiness score" and compared
-    against a threshold derived from the Sensitivity parameter. A minimum
-    continuous-detection duration (debounce) has to elapse before the
-    reduction actually engages, which is what keeps short consonants from
-    triggering it. Once engaged, gain moves smoothly (attack/release, in ms)
-    toward an adjustable reduction depth in dB — never a full mute — so the
-    result still sounds like a breath happened, just quieter, rather than an
-    edited-out silence.
+    1. Is this unvoiced noise at all, rather than a sung/spoken tone?
+       - spectral flatness (noise is flat; voiced content is peaky/harmonic)
+       - harmonicity, via the peak of the normalised autocorrelation in the
+         vocal pitch range (low peak = inharmonic = noise-like)
+
+    2. Is that noise LOW-FREQUENCY weighted, i.e. a breath rather than
+       sibilance? This is the group that actually separates breath from
+       "s"/"sh", which are every bit as noisy and inharmonic as a breath:
+       - spectral centroid (breath ~1-2.5 kHz; /s/ ~6-8 kHz)
+       - fraction of energy above 5 kHz (high for sibilance, low for
+         breath), with a hard veto above 0.5
+       - zero-crossing rate, as a cheap corroborating vote
+
+    The two groups are MULTIPLIED, not added. Adding them (as an earlier
+    version of this file did) lets sibilance clear the threshold on the noise
+    features alone, since it scores just as high there as breath does — which
+    shows up in use as consonants being chewed up.
+
+    A level gate additionally prefers frames quieter than the recent singing,
+    but its upper edge is deliberately soft: a close-mic'd breath can sit only
+    a few dB below the vocal, and a hard gate there discards exactly those
+    (the main source of missed breaths). A minimum continuous-detection
+    duration (debounce) then has to elapse before reduction engages, which is
+    what keeps short consonants from triggering it. Once engaged, gain moves
+    smoothly (attack/release, in ms) toward an adjustable reduction depth in
+    dB — never a full mute — so the result still sounds like a breath
+    happened, just quieter, rather than an edited-out silence.
 */
 class BreathDetector
 {
@@ -57,7 +69,7 @@ public:
         float reductionDb = -18.0f;  // ducking depth applied to detected breaths
         float attackMs    = 8.0f;    // time to duck in once engaged
         float releaseMs   = 150.0f;  // time to recover once a breath ends
-        float minLengthMs = 50.0f;   // continuous detection required to engage
+        float minLengthMs = 100.0f;  // continuous detection required to engage
         float lookaheadMs = 5.0f;    // reported via getLatencySamples()
     };
     void setParameters (const Parameters& newParams);
@@ -97,6 +109,7 @@ private:
 
     std::vector<float> windowedTime;  // scratch: time-ordered copy of history, size fftSize
     std::vector<float> fftScratch;    // scratch: size fftSize * 2 for JUCE FFT
+    std::vector<float> decimated;     // scratch: 2x-decimated copy for the autocorrelation
 
     // Slow envelope of "how loud the performance normally is", used so the
     // energy gate finds passages quieter than the singing rather than an
