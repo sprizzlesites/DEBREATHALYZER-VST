@@ -68,8 +68,8 @@ public:
         float sensitivity = 0.5f;    // 0..1: higher catches more/quieter breaths
         float reductionDb = -18.0f;  // ducking depth applied to detected breaths
         float attackMs    = 8.0f;    // time to duck in once engaged
-        float releaseMs   = 150.0f;  // time to recover once a breath ends
-        float minLengthMs = 100.0f;  // continuous detection required to engage
+        float releaseMs   = 80.0f;   // time to recover once a breath ends
+        float minLengthMs = 60.0f;   // continuous detection required to engage
         float lookaheadMs = 5.0f;    // reported via getLatencySamples()
     };
     void setParameters (const Parameters& newParams);
@@ -125,6 +125,13 @@ private:
     float currentGain = 1.0f;
     float attackCoeff = 0.0f;
     float releaseCoeff = 0.0f;
+
+    // The score is smoothed across hops before thresholding: real breath
+    // frames jitter, and thresholding the raw per-hop score starved the
+    // minimum-duration debounce so most breaths never engaged.
+    float smoothedScore = 0.0f;
+    float scoreSmoothCoeff = 0.0f;
+    static constexpr float scoreSmoothingMs = 45.0f;
 
     float lastScore = 0.0f;
 

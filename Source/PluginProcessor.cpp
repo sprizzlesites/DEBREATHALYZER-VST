@@ -38,12 +38,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout DeBreathalyzerProcessor::cre
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
         juce::ParameterID { ParamIDs::release, 1 }, "Release",
-        juce::NormalisableRange<float> (20.0f, 500.0f, 0.1f), 150.0f,
+        juce::NormalisableRange<float> (20.0f, 500.0f, 0.1f), 80.0f,
         juce::AudioParameterFloatAttributes().withLabel ("ms")));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
         juce::ParameterID { ParamIDs::minLength, 1 }, "Min Length",
-        juce::NormalisableRange<float> (20.0f, 400.0f, 0.1f), 100.0f,
+        juce::NormalisableRange<float> (20.0f, 400.0f, 0.1f), 60.0f,
         juce::AudioParameterFloatAttributes().withLabel ("ms")));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
@@ -99,8 +99,8 @@ void DeBreathalyzerProcessor::updateDetectorParameters()
     p.sensitivity = sensitivityParam != nullptr ? sensitivityParam->load() / 100.0f : 0.5f;
     p.reductionDb = reductionParam != nullptr ? reductionParam->load() : -18.0f;
     p.attackMs    = attackParam    != nullptr ? attackParam->load()    : 8.0f;
-    p.releaseMs   = releaseParam   != nullptr ? releaseParam->load()  : 150.0f;
-    p.minLengthMs = minLengthParam != nullptr ? minLengthParam->load(): 100.0f;
+    p.releaseMs   = releaseParam   != nullptr ? releaseParam->load()  : 80.0f;
+    p.minLengthMs = minLengthParam != nullptr ? minLengthParam->load(): 60.0f;
     p.lookaheadMs = lookaheadParam != nullptr ? lookaheadParam->load(): 5.0f;
 
     detector.setParameters (p);

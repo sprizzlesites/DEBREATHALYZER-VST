@@ -15,25 +15,49 @@ namespace
     // helps separate breath from sibilance anyway.
     constexpr double analysisCeilingHz = 12000.0;
 
-    // Spectral centroid, measured over the analysis band. Note these are much
-    // higher than the "breath is 1-2.5 kHz" figures quoted in the literature:
-    // those describe where the energy peaks, whereas a linear-bin centroid is
-    // pulled upward by the sheer number of high bins. Calibrated against
-    // measured frames (see Test/BreathDetectorTest.cpp).
-    constexpr float centroidFullCreditHz = 4200.0f;
-    constexpr float centroidZeroHz       = 7000.0f;
+    // ---- Calibrated against measured frames from a real dry rap vocal -------
+    // (143 s, ~8 breaths/min located by level valleys, i.e. independently of
+    // any of the spectral features below, so the calibration isn't circular.)
+    // Measured p10/p50/p90, breath vs in-phrase sibilance vs voiced:
+    //
+    //                  breath              sibilant            voiced
+    //   hfRatio        .031 / .074 / .124  .022 / .213 / .925  .001/.016/.113
+    //   centroid Hz    3589 / 3794 / 4090  2801 / 4394 / 7314  1570/2705/3997
+    //   flatness       .510 / .638 / .693  .428 / .581 / .732  .162/.354/.599
+    //   harmonicity    .233 / .336 / .375  .140 / .203 / .294  .461/.665/.855
+    //   zcr            .087 / .125 / .155  .075 / .173 / .365  .016/.063/.137
+    //
+    // Two lessons from real audio that synthetic noise got wrong:
+    //  - real breath is FAR more periodic than filtered white noise
+    //    (harmonicity ~0.34, not ~0.13) - it is resonated by the vocal tract.
+    //  - centroid barely separates breath from sibilance (3794 vs 4394); on
+    //    synthetic signals it looked decisive. hfRatio is the real workhorse.
 
-    // Fraction of in-band energy above 5 kHz. This is the single strongest
-    // discriminator: breath sits around 0.05, /s/ near 0.99, /esh/ near 0.8.
-    constexpr float hfRatioFullCredit = 0.16f;
-    constexpr float hfRatioZero       = 0.42f;
+    // Voicing. Breath tops out at .375 and voiced starts at .461, so this ramp
+    // sits in the gap and is what actually keeps the plugin off the vocal.
+    constexpr float harmFullCredit = 0.40f;
+    constexpr float harmZero       = 0.54f;
+
+    // Noisiness. Voiced median .354, breath p10 .510 - but real breath frames
+    // scatter well below their own median, so the ramp starts lower than the
+    // percentiles alone suggest; the level gate picks up the discrimination
+    // that costs.
+    constexpr float flatZero       = 0.30f;
+    constexpr float flatFullCredit = 0.46f;
+
+    // Fraction of in-band energy above 5 kHz - the single strongest
+    // discriminator, and a NECESSARY condition (it multiplies the rest).
+    constexpr float hfRatioFullCredit = 0.12f;   // breath p90 = .124
+    constexpr float hfRatioZero       = 0.30f;
     // Above this the frame is sibilance, full stop - no score can rescue it.
-    constexpr float hfRatioVeto       = 0.50f;
+    constexpr float hfRatioVeto       = 0.35f;
 
-    // Zero-crossing rate: cheap and correlated with centroid, kept as a
-    // low-weight corroborating vote. Breath sits well below fricatives.
-    constexpr float zcrFullCredit = 0.20f;
-    constexpr float zcrZero       = 0.42f;
+    // Centroid and ZCR overlap too much on real material to decide anything on
+    // their own; they only trim the score once hfRatio has already passed.
+    constexpr float centroidFullCreditHz = 3800.0f;
+    constexpr float centroidZeroHz       = 5200.0f;
+    constexpr float zcrFullCredit = 0.16f;
+    constexpr float zcrZero       = 0.34f;
 
     // Band edges used for the energy split (Hz).
     constexpr double bandLowHz     = 300.0;    // below this: rumble/fundamental
@@ -46,6 +70,12 @@ namespace
     inline float rampDown (float x, float full, float zero) noexcept
     {
         return juce::jlimit (0.0f, 1.0f, (zero - x) / (zero - full));
+    }
+
+    // Maps x to 0.0 at or below `zero`, 1.0 at or above `full`.
+    inline float rampUp (float x, float zero, float full) noexcept
+    {
+        return juce::jlimit (0.0f, 1.0f, (x - zero) / (full - zero));
     }
 }
 
@@ -73,6 +103,7 @@ void BreathDetector::reset()
     candidateHopSamples = 0;
     targetGain = 1.0f;
     currentGain = 1.0f;
+    smoothedScore = 0.0f;
     lastScore = 0.0f;
 }
 
@@ -88,6 +119,10 @@ void BreathDetector::updateTimeConstants()
 
     attackCoeff  = std::exp (-1.0 / (sr * juce::jmax (0.001, (double) params.attackMs) / 1000.0));
     releaseCoeff = std::exp (-1.0 / (sr * juce::jmax (0.001, (double) params.releaseMs) / 1000.0));
+
+    // One pole per analysis hop (the hop is the score's sample interval).
+    scoreSmoothCoeff = (float) std::exp (-(double) hopSize * 1000.0
+                                          / (sr * (double) scoreSmoothingMs));
 
     minLengthSamplesTarget = (int) std::round (sr * params.minLengthMs / 1000.0);
     lookaheadSamples = (int) std::round (sr * params.lookaheadMs / 1000.0);
@@ -246,19 +281,27 @@ void BreathDetector::analyseFrame()
     // Adding these instead of multiplying was the original mistake: sibilance
     // scores just as high as breath on noisiness, so an additive score let
     // /s/ and /esh/ clear the threshold on the noise terms alone.
-    const float noisiness = juce::jlimit (0.0f, 1.0f,
-        0.5f * spectralFlatness + 0.5f * (1.0f - harmonicity));
+    // Both halves of "is this noise" must agree - MULTIPLIED, not averaged.
+    // Averaging let a voiced frame (flatness .354, harmonicity .665) reach
+    // ~0.35, which on real material sat right on the decision threshold: the
+    // detector was a hair away from ducking the vocal itself.
+    const float noisiness = rampDown (harmonicity, harmFullCredit, harmZero)
+                          * rampUp (spectralFlatness, flatZero, flatFullCredit);
 
     const float centroidScore = rampDown (centroidHz, centroidFullCreditHz, centroidZeroHz);
     const float hfScore       = rampDown (hfRatio, hfRatioFullCredit, hfRatioZero);
     const float zcrScore      = rampDown (zcr, zcrFullCredit, zcrZero);
 
-    const float breathShape = juce::jlimit (0.0f, 1.0f,
-        0.45f * centroidScore + 0.35f * hfScore + 0.20f * zcrScore);
+    // hfRatio gates the whole shape term rather than being averaged into it:
+    // on real audio it is the only feature that reliably separates breath from
+    // sibilance, so no amount of agreement from the weaker features should be
+    // able to outvote it. Centroid and ZCR only trim what hfRatio allows.
+    const float breathShape = hfScore * (0.60f + 0.40f * (0.60f * centroidScore
+                                                          + 0.40f * zcrScore));
 
     // A breath also has to actually have energy in the breath band; a frame
-    // that is all rumble (or all hiss) is not one.
-    const float bandScore = juce::jlimit (0.0f, 1.0f, breathBandRatio / 0.35f);
+    // that is all rumble (or all hiss) is not one. (Breath p10 = .354.)
+    const float bandScore = juce::jlimit (0.0f, 1.0f, breathBandRatio / 0.30f);
 
     // --- level gate --------------------------------------------------------
     // Only passages quieter than the recent singing are plausible breaths, but
@@ -272,7 +315,7 @@ void BreathDetector::analyseFrame()
     constexpr float floorDb = -68.0f;
     const float riseGate = juce::jlimit (0.0f, 1.0f, (shortTermDb - floorDb) / 6.0f);
     const float fallGate = juce::jlimit (0.0f, 1.0f, (ceilingDb - shortTermDb) / 10.0f);
-    const float energyGate = riseGate * (0.5f + 0.5f * fallGate);
+    const float energyGate = riseGate * (0.30f + 0.70f * fallGate);
 
     float finalScore = noisiness * breathShape * bandScore * energyGate;
 
@@ -281,10 +324,17 @@ void BreathDetector::analyseFrame()
     if (hfRatio >= hfRatioVeto)
         finalScore = 0.0f;
 
-    lastScore = finalScore;
+    // Smooth the score across hops before thresholding. Measured on real
+    // vocals, the per-frame features jitter enough that a breath's raw score
+    // flickers either side of the threshold - so the minimum-duration debounce
+    // below almost never accumulated and most breaths were simply missed, even
+    // where every individual feature looked right on average. A breath is a
+    // sustained event; the decision should be made on a sustained measurement.
+    smoothedScore = finalScore + scoreSmoothCoeff * (smoothedScore - finalScore);
+    lastScore = smoothedScore;
 
-    const float threshold = juce::jmap (params.sensitivity, 0.0f, 1.0f, 0.50f, 0.16f);
-    const bool detectedThisHop = finalScore >= threshold;
+    const float threshold = juce::jmap (params.sensitivity, 0.0f, 1.0f, 0.55f, 0.20f);
+    const bool detectedThisHop = smoothedScore >= threshold;
 
     // Minimum-duration debounce on the way IN only; the release ramp (in
     // process(), per-sample) handles smoothing on the way out. A leaky

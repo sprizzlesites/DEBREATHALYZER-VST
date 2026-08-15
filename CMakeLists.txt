@@ -110,4 +110,18 @@ if(DeBreathalyzer_BUILD_TESTS)
     target_link_libraries(DeBreathalyzerTest PRIVATE
         juce::juce_audio_basics juce::juce_dsp
         juce::juce_recommended_config_flags)
+
+    # Offline A/B renderer: run the detector over a real take and list the
+    # regions it ducked. This is how the feature thresholds were calibrated -
+    # synthetic noise is not a substitute for a real vocal.
+    juce_add_console_app(DeBreathalyzerRender PRODUCT_NAME "DeBreathalyzerRender")
+    target_sources(DeBreathalyzerRender PRIVATE
+        Tools/RenderFile.cpp
+        Source/DSP/BreathDetector.cpp)
+    target_include_directories(DeBreathalyzerRender PRIVATE Source)
+    target_compile_definitions(DeBreathalyzerRender PRIVATE
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+    target_link_libraries(DeBreathalyzerRender PRIVATE
+        juce::juce_audio_basics juce::juce_dsp
+        juce::juce_recommended_config_flags)
 endif()
